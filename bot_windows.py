@@ -935,29 +935,36 @@ async def complete_onboarding(page, max_steps=10, first_name=None, last_name=Non
             if "Finish creating" in body or "First name" in body:
                 log("  [ONBOARDING] API account form detected, filling...")
 
-                # Fill first name if empty
-                fname_input = await page.query_selector('input[aria-label="First name"], input[name="first_name"], input[placeholder*="First"]')
-                if fname_input:
-                    val = await fname_input.input_value()
-                    if not val and first_name:
-                        await fname_input.fill(first_name)
-                        log(f"  [ONBOARDING] Filled first name: {first_name}")
-                    elif not val:
-                        await fname_input.fill("Alex")
-                        log("  [ONBOARDING] Filled first name: Alex (default)")
-
-                # Fill last name if empty
-                lname_input = await page.query_selector('input[aria-label="Last name"], input[name="last_name"], input[placeholder*="Last"]')
-                if lname_input:
-                    val = await lname_input.input_value()
-                    if not val and last_name:
-                        await lname_input.fill(last_name)
-                        log(f"  [ONBOARDING] Filled last name: {last_name}")
-                    elif not val:
-                        await lname_input.fill("Smith")
-                        log("  [ONBOARDING] Filled last name: Smith (default)")
-
-                await asyncio.sleep(1)
+                # Find inputs via label[for] — IDs are dynamic (_r_b_, _r_e_)
+                filled = await page.evaluate("""
+                    (args) => {
+                        let filled = {first: false, last: false};
+                        document.querySelectorAll('label').forEach(l => {
+                            const t = (l.innerText || '').trim();
+                            const forId = l.htmlFor;
+                            if (!forId) return;
+                            const input = document.getElementById(forId);
+                            if (!input) return;
+                            if (t === 'First name' && !input.value && args.firstName) {
+                                // Set value via React-compatible method
+                                const nativeSet = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                                nativeSet.call(input, args.firstName);
+                                input.dispatchEvent(new Event('input', {bubbles: true}));
+                                input.dispatchEvent(new Event('change', {bubbles: true}));
+                                filled.first = true;
+                            }
+                            if (t === 'Last name' && !input.value && args.lastName) {
+                                const nativeSet = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                                nativeSet.call(input, args.lastName);
+                                input.dispatchEvent(new Event('input', {bubbles: true}));
+                                input.dispatchEvent(new Event('change', {bubbles: true}));
+                                filled.last = true;
+                            }
+                        });
+                        return filled;
+                    }
+                """, {"firstName": first_name or "Alex", "lastName": last_name or "Smith"})
+                log(f"  [ONBOARDING] Filled: {filled}")
 
             # Click submit button
             clicked = await page.evaluate("""
