@@ -15,11 +15,11 @@ Usage:
 
 import asyncio
 import argparse
-import imaplib
 import json
 import os
 import random
 import re
+import requests
 import string
 import sys
 import time
@@ -34,12 +34,7 @@ from dotenv import load_dotenv
 SCRIPT_DIR = Path(__file__).parent
 load_dotenv(SCRIPT_DIR / ".env")
 
-IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com")
-IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
-IMAP_USER = os.getenv("IMAP_USER", "")
-IMAP_PASS = os.getenv("IMAP_PASS", "")
-BASE_GMAIL = os.getenv("BASE_GMAIL", "").strip()
-EMAIL_DOMAINS = [d.strip() for d in os.getenv("EMAIL_DOMAINS", "guajimi.social").split(",")]
+TEMPMAIL_API_URL = os.getenv("TEMPMAIL_API_URL", "http://localhost:8096")
 PROXY_URL = os.getenv("PROXY_URL", "")
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", str(SCRIPT_DIR / "data" / "output")))
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", str(SCRIPT_DIR / "data" / "screenshots")))
@@ -79,13 +74,14 @@ def random_name():
     return random.choice(FIRST_NAMES), random.choice(LAST_NAMES)
 
 
-def random_email(first: str, last: str) -> str:
-    """Generate a unique email using custom domain (no dot-trick dedup)."""
-    # Use custom domain — each address is truly unique, no Meta dedup
-    domain = random.choice(EMAIL_DOMAINS)
-    # Random alphanumeric prefix (12 chars)
-    prefix = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
-    return f"{prefix}@{domain}"
+def generate_tempmail_email() -> str:
+    """Generate a fresh email via the TempMail Aggregator API."""
+    resp = requests.post(f"{TEMPMAIL_API_URL}/api/v1/email/generate", timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    email_addr = data["email"]
+    log(f"  [TEMPMAIL] Generated email: {email_addr} (provider: {data.get('provider', '?')})")
+    return email_addr
 
 
 def random_birthday() -> tuple:
@@ -114,87 +110,52 @@ def log(msg: str):
 
 
 # ---------------------------------------------------------------------------
-# IMAP OTP reader
+# TempMail OTP reader
 # ---------------------------------------------------------------------------
-def snapshot_meta_uids() -> set:
-    """Get all current Meta email UIDs. Call BEFORE registration starts.
-    
-    Returns set of UID bytes that already exist in inbox.
-    Any email NOT in this set is guaranteed to be new.
-    """
-    uids = set()
-    try:
-        imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-        imap.login(IMAP_USER, IMAP_PASS)
-        for folder in ['INBOX', '"[Gmail]/All Mail"']:
-            try:
-                imap.select(folder)
-                _, msg_nums = imap.search(
-                    None,
-                    '(OR FROM "notification@email.meta.com" '
-                    'FROM "notification@facebookmail.com")'
-                )
-                if msg_nums[0]:
-                    uids.update(msg_nums[0].split())
-            except Exception:
-                pass
-        imap.logout()
-    except Exception as e:
-        log(f"  [OTP] UID snapshot error: {e}")
-    log(f"  [OTP] Snapshot: {len(uids)} known Meta emails")
-    return uids
+def fetch_tempmail_otp(email_addr: str, timeout: int = 120,
+                       poll_interval: int = 5) -> str | None:
+    """Poll TempMail Aggregator for a Meta verification code.
 
-
-def fetch_otp(email_addr: str, timeout: int = 120, poll_interval: int = 5,
-              known_uids: set | None = None) -> str | None:
-    """Poll IMAP for NEW Meta verification code.
-    
-    Uses UID-based filtering: only considers emails NOT in known_uids.
-    Bulletproof against old emails, timezone issues, date parsing failures.
+    Checks the inbox every *poll_interval* seconds for up to *timeout* seconds.
+    Extracts a 6-digit OTP from the message body via regex.
     """
-    log(f"  [OTP] Waiting for verification email at {email_addr} (timeout {timeout}s)...")
+    log(f"  [OTP] Polling TempMail for {email_addr} (timeout {timeout}s)...")
     deadline = time.time() + timeout
-    if known_uids is None:
-        known_uids = set()
+    attempt = 0
 
     while time.time() < deadline:
+        attempt += 1
         try:
-            imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-            imap.login(IMAP_USER, IMAP_PASS)
-            imap.select("INBOX")
-
-            _, msg_nums = imap.search(
-                None,
-                '(OR FROM "notification@email.meta.com" '
-                'FROM "notification@facebookmail.com")'
+            resp = requests.get(
+                f"{TEMPMAIL_API_URL}/api/v1/email/{email_addr}/messages",
+                timeout=10,
             )
+            resp.raise_for_status()
+            data = resp.json()
+            messages = data.get("messages", [])
 
-            new_code = None
-            if msg_nums[0]:
-                for num in reversed(msg_nums[0].split()):
-                    if num in known_uids:
-                        continue
-
-                    _, data = imap.fetch(num, "(BODY[HEADER.FIELDS (SUBJECT)])")
-                    header = data[0][1].decode(errors="ignore")
-
-                    m = re.search(r"(\d{5,8})", header)
+            if messages:
+                log(f"  [OTP] Got {len(messages)} message(s) (attempt {attempt})")
+                for msg in messages:
+                    body = msg.get("body", "") or ""
+                    subject = msg.get("subject", "") or ""
+                    text = subject + " " + body
+                    m = re.search(r'\b(\d{6})\b', text)
                     if m:
-                        new_code = m.group(1)
-                        imap.store(num, "+FLAGS", "\\Seen")
-                        log(f"  [OTP] Got NEW code: {new_code} (uid={num.decode()})")
-                        break
-
-            imap.logout()
-            if new_code:
-                return new_code
+                        code = m.group(1)
+                        log(f"  [OTP] Extracted code: {code}")
+                        return code
+                    log(f"  [OTP] No 6-digit code in message: {subject[:60]}")
+            else:
+                remaining = int(deadline - time.time())
+                log(f"  [OTP] No messages yet (attempt {attempt}, {remaining}s left)")
 
         except Exception as e:
-            log(f"  [OTP] IMAP error: {e}")
+            log(f"  [OTP] TempMail error: {e}")
 
         time.sleep(poll_interval)
 
-    log("  [OTP] Timeout waiting for code")
+    log("  [OTP] Timeout — no OTP received")
     return None
 
 
@@ -456,8 +417,6 @@ async def step_register(page, email_addr, password, first_name, last_name,
     except Exception:
         pass
 
-    known_uids = snapshot_meta_uids()
-
     # Step 3: Enter email
     log(f"  [3] Entering email: {email_addr}")
     email_selectors = [
@@ -627,7 +586,7 @@ async def step_register(page, email_addr, password, first_name, last_name,
 
         # --- Wait for OTP ---
         log("  [5] Waiting for OTP verification...")
-        otp_code = fetch_otp(email_addr, timeout=120, known_uids=known_uids)
+        otp_code = fetch_tempmail_otp(email_addr, timeout=120)
         if not otp_code:
             result["error"] = "OTP timeout - no code received"
             await take_screenshot(page, "07_otp_timeout")
@@ -711,7 +670,7 @@ async def step_register(page, email_addr, password, first_name, last_name,
           or "verification code" in page_text.lower()):
         # Direct OTP after email entry
         log("  [4] OTP screen detected after email entry")
-        otp_code = fetch_otp(email_addr, timeout=120, known_uids=known_uids)
+        otp_code = fetch_tempmail_otp(email_addr, timeout=120)
         if not otp_code:
             result["error"] = "OTP timeout after email entry"
             return result
@@ -1335,7 +1294,7 @@ async def run_registrations(count: int, headless: bool = False,
     async with async_playwright() as playwright:
         for i in range(count):
             first, last = random_name()
-            email_addr = random_email(first, last)
+            email_addr = generate_tempmail_email()
             password = random_password()
             month, day, year = random_birthday()
 
@@ -1362,7 +1321,7 @@ async def run_registrations(count: int, headless: bool = False,
                         break
                     else:
                         log(f"  Retry {attempt + 1}/{max_retries}...")
-                        email_addr = random_email(first, last)
+                        email_addr = generate_tempmail_email()
                         await asyncio.sleep(random.uniform(3, 8))
 
                 except Exception as e:
