@@ -891,17 +891,91 @@ async def wait_for_redirect(page, context, timeout=60):
 # ---------------------------------------------------------------------------
 # Billing flow
 # ---------------------------------------------------------------------------
-async def step_billing(page, context, first_name, last_name) -> dict:
+async def complete_onboarding(page, max_steps=15):
+    """Complete the dev.meta.ai onboarding flow by clicking through all steps."""
+    log("  [ONBOARDING] Completing onboarding flow...")
+    for step in range(max_steps):
+        url = page.url
+        # If we're no longer on onboarding, we're done
+        if "/onboarding" not in url and "/onboarding" not in (await page.evaluate("window.location.pathname")):
+            log(f"  [ONBOARDING] Completed after {step} steps. URL: {url[:80]}")
+            return True
+
+        # Try clicking various onboarding buttons
+        clicked = await page.evaluate("""
+            () => {
+                const selectors = [
+                    'button:has-text("Get started")',
+                    'button:has-text("Continue")',
+                    'button:has-text("Next")',
+                    'button:has-text("Accept")',
+                    'button:has-text("Agree")',
+                    'button:has-text("Done")',
+                    'button:has-text("Finish")',
+                    'div[role="button"]:has-text("Get started")',
+                    'div[role="button"]:has-text("Continue")',
+                    'div[role="button"]:has-text("Next")',
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.offsetParent !== null) {
+                        el.click();
+                        return el.innerText.trim();
+                    }
+                }
+                return null;
+            }
+        """)
+        if clicked:
+            log(f"  [ONBOARDING] Step {step+1}: Clicked '{clicked}'")
+            await asyncio.sleep(3)
+        else:
+            # Maybe onboarding is done but page hasn't navigated yet
+            await asyncio.sleep(2)
+            if "/onboarding" not in page.url:
+                log(f"  [ONBOARDING] Completed (no more buttons). URL: {page.url[:80]}")
+                return True
+            # Check if there's a text input (some onboarding steps require input)
+            has_input = await page.evaluate("!!document.querySelector('input[type=\"text\"], textarea')")
+            if has_input:
+                log(f"  [ONBOARDING] Step {step+1}: Has text input, skipping (manual step)")
+                break
+            log(f"  [ONBOARDING] No buttons found at step {step+1}, stopping")
+            break
+
+    return "/onboarding" not in page.url
+
+
+async def step_billing(page, context, first_name, last_name, project_id=None, team_id=None) -> dict:
     """Navigate to billing page and add payment card."""
     result = {"status": "failed"}
 
-    log("  [7] Navigating to billing page...")
-    await page.goto("https://dev.meta.ai/billing", wait_until="domcontentloaded", timeout=30000)
+    # Complete onboarding first
+    await complete_onboarding(page)
+    await asyncio.sleep(2)
+
+    # Build billing URL with project_id and team_id if available
+    billing_base = "https://dev.meta.ai/billing"
+    if project_id and team_id:
+        billing_url_target = f"{billing_base}?project_id={project_id}&team_id={team_id}"
+    else:
+        billing_url_target = billing_base
+
+    log(f"  [7] Navigating to billing page: {billing_url_target[:80]}")
+    await page.goto(billing_url_target, wait_until="domcontentloaded", timeout=30000)
     try:
         await page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
         pass
     await asyncio.sleep(3)
+
+    # Complete onboarding again if redirected
+    if "/onboarding" in page.url:
+        await complete_onboarding(page)
+        await asyncio.sleep(2)
+        if project_id and team_id:
+            await page.goto(billing_url_target, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
 
     billing_url = page.url
     log(f"  [7] Billing URL: {billing_url}")
@@ -1050,17 +1124,36 @@ async def step_billing(page, context, first_name, last_name) -> dict:
 # ---------------------------------------------------------------------------
 # API Key flow
 # ---------------------------------------------------------------------------
-async def step_api_key(page, context) -> dict:
+async def step_api_key(page, context, project_id=None, team_id=None) -> dict:
     """Navigate to API keys page and create a key."""
     result = {"status": "failed"}
 
-    log("  [8] Navigating to API keys page...")
-    await page.goto("https://dev.meta.ai/api-keys", wait_until="domcontentloaded", timeout=30000)
+    # Complete onboarding first
+    await complete_onboarding(page)
+    await asyncio.sleep(2)
+
+    # Build API keys URL with project_id and team_id if available
+    api_base = "https://dev.meta.ai/api-keys"
+    if project_id and team_id:
+        api_url_target = f"{api_base}?project_id={project_id}&team_id={team_id}"
+    else:
+        api_url_target = api_base
+
+    log(f"  [8] Navigating to API keys page: {api_url_target[:80]}")
+    await page.goto(api_url_target, wait_until="domcontentloaded", timeout=30000)
     try:
         await page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
         pass
     await asyncio.sleep(3)
+
+    # Complete onboarding again if redirected
+    if "/onboarding" in page.url:
+        await complete_onboarding(page)
+        await asyncio.sleep(2)
+        if project_id and team_id:
+            await page.goto(api_url_target, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
 
     await dismiss_modals(page)
 
@@ -1216,7 +1309,7 @@ async def register_one(context, email_addr, password, first_name, last_name,
 
         # Billing
         if do_billing:
-            billing_result = await step_billing(page, context, first_name, last_name)
+            billing_result = await step_billing(page, context, first_name, last_name, project_id, team_id)
             if billing_result.get("team_id"):
                 result["team_id"] = billing_result["team_id"]
             if billing_result.get("project_id"):
@@ -1235,7 +1328,7 @@ async def register_one(context, email_addr, password, first_name, last_name,
 
         # API Key
         if do_apikey:
-            api_result = await step_api_key(page, context)
+            api_result = await step_api_key(page, context, project_id, team_id)
             if api_result.get("api_key"):
                 result["api_key"] = api_result["api_key"]
             if api_result.get("team_id") and "team_id" not in result:
