@@ -1308,23 +1308,46 @@ async def step_api_key(page, context, project_id=None, team_id=None) -> dict:
     # Try multiple extraction methods
     api_key = None
 
-    # Method 1: Look for AAI... pattern (Meta API keys start with AAI)
-    aai_match = re.search(r'(AAI[A-Za-z0-9_-]{20,})', body)
-    if aai_match:
-        api_key = aai_match.group(1)
+    # Method 1: Check input values for LLM_ prefix (most reliable)
+    input_keys = await page.evaluate("""
+        () => {
+            const r = [];
+            document.querySelectorAll('input').forEach(el => {
+                const v = el.value || '';
+                if (v.startsWith('LLM_') || v.startsWith('AAI') || (v.length > 30 && v.startsWith('eyJ'))) {
+                    r.push(v);
+                }
+            });
+            return r;
+        }
+    """)
+    if input_keys:
+        api_key = input_keys[0]
 
-    # Method 2: Look for Bearer tokens
+    # Method 2: Look for LLM_ pattern in body text (full, not truncated)
+    if not api_key:
+        llm_match = re.search(r'(LLM_[A-Za-z0-9_-]{20,})', body)
+        if llm_match:
+            api_key = llm_match.group(1)
+
+    # Method 3: Look for AAI pattern
+    if not api_key:
+        aai_match = re.search(r'(AAI[A-Za-z0-9_-]{20,})', body)
+        if aai_match:
+            api_key = aai_match.group(1)
+
+    # Method 4: Look for Bearer tokens
     if not api_key:
         bearer_match = re.search(r'(eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,})', body)
         if bearer_match:
             api_key = bearer_match.group(1)
 
-    # Method 3: Look for long alphanumeric strings in code/pre/span elements
+    # Method 5: Look for long alphanumeric strings in code/pre/span elements
     if not api_key:
         key_els = await page.evaluate("""
             Array.from(document.querySelectorAll('[class*="key"], [data-testid*="key"], code, pre, span')).filter(el => {
                 const t = el.innerText || '';
-                return t.startsWith('AAI') || t.startsWith('Bearer ') || t.startsWith('eyJ') ||
+                return t.startsWith('LLM_') || t.startsWith('AAI') || t.startsWith('Bearer ') || t.startsWith('eyJ') ||
                        (t.length > 30 && /^[A-Za-z0-9_-]+$/.test(t));
             }).map(el => el.innerText.trim())
         """)
