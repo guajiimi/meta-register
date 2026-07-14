@@ -663,9 +663,11 @@ async def step_register(page, email_addr, password, first_name, last_name,
                 if el:
                     await el.click()
                     await asyncio.sleep(0.3)
-                    await el.fill(otp_code)
+                    await el.fill("")
+                    for ch in otp_code:
+                        await el.type(ch, delay=random.randint(50, 120))
                     otp_filled = True
-                    log(f"  [5] OTP filled via {sel}")
+                    log(f"  [5] OTP typed via {sel}")
                     break
             except Exception:
                 continue
@@ -736,17 +738,49 @@ async def step_register(page, email_addr, password, first_name, last_name,
             'input[type="tel"]',
             'input[type="number"]',
         ]
+        otp_filled = False
         for sel in otp_selectors:
             try:
                 el = await page.wait_for_selector(sel, timeout=5000, state="visible")
                 if el:
                     await el.click()
-                    await el.fill(otp_code)
+                    await asyncio.sleep(0.3)
+                    await el.fill("")
+                    # Type char by char for Meta's React inputs
+                    for ch in otp_code:
+                        await el.type(ch, delay=random.randint(50, 120))
+                    otp_filled = True
+                    log(f"  [4] OTP typed via {sel}")
                     break
             except Exception:
                 continue
 
+        if not otp_filled:
+            log("  [4] WARN: OTP not filled by selector, trying fallback")
+            inputs = await page.query_selector_all("input")
+            for inp in inputs:
+                try:
+                    vis = (await inp.bounding_box()) is not None
+                    itype = await inp.get_attribute("type") or ""
+                    if vis and itype in ("text", "tel", "number", ""):
+                        await inp.click()
+                        await inp.fill("")
+                        for ch in otp_code:
+                            await inp.type(ch, delay=random.randint(50, 120))
+                        otp_filled = True
+                        log(f"  [4] OTP typed via fallback input")
+                        break
+                except Exception:
+                    continue
+
+        if not otp_filled:
+            result["error"] = "Could not find OTP input field"
+            return result
+
         await asyncio.sleep(random.uniform(1, 3))
+
+        # Click Next/Continue after OTP — wait for button to be enabled
+        otp_submitted = False
         for sel in [
             'div[role="button"]:has-text("Next")',
             'div[role="button"]:has-text("Continue")',
@@ -754,12 +788,34 @@ async def step_register(page, email_addr, password, first_name, last_name,
             try:
                 el = await page.wait_for_selector(sel, timeout=5000, state="visible")
                 if el:
-                    await el.click(force=True)
-                    break
+                    for _ in range(20):  # up to 10s for button to enable
+                        dis = await el.get_attribute("aria-disabled")
+                        if dis != "true":
+                            break
+                        await asyncio.sleep(0.5)
+                    box = await el.bounding_box()
+                    if box and box["height"] >= 20:
+                        await el.scroll_into_view_if_needed()
+                        await asyncio.sleep(0.3)
+                        await el.click(force=True)
+                        log(f"  [4] Post-OTP '{sel}' clicked")
+                        otp_submitted = True
+                        break
             except Exception:
                 continue
 
-        await asyncio.sleep(random.uniform(3, 6))
+        if not otp_submitted:
+            log("  [4] WARN: No Next/Continue button found after OTP")
+
+        # Wait for redirect after OTP submit
+        url_before_otp = page.url
+        for _wait in range(15):  # max 15s
+            await asyncio.sleep(1)
+            if page.url != url_before_otp:
+                log(f"  [4] URL changed after OTP: {page.url[:80]}")
+                break
+
+        await asyncio.sleep(random.uniform(2, 4))
         await take_screenshot(page, "08_after_otp_entry")
 
     elif "password" in page_text.lower() and "login" in page_text.lower():
