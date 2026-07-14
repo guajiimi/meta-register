@@ -699,22 +699,38 @@ class MetaAPI:
         }).encode()
         ciphertext = aesgcm.encrypt(nonce, plaintext, None)
 
-        # 8. Build JWE compact serialization
-        eph_nums = eph_public.public_numbers()
-        jwe_header = {
-            "alg": "ECDH-ES", "enc": "A256GCM", "apu": "",
-            "apv": apv,
-            "epk": {
-                "kty": "EC", "crv": "P-256",
-                "x": base64.urlsafe_b64encode(eph_nums.x.to_bytes(32, 'big')).rstrip(b"=").decode(),
-                "y": base64.urlsafe_b64encode(eph_nums.y.to_bytes(32, 'big')).rstrip(b"=").decode(),
+        # 8. Build JWE — Meta's custom format with card data prefix
+        # Part 0: base64url of card data with $e2ee placeholders
+        card_data_clear = json.dumps({
+            "data": {
+                "credit_card": "$e2ee",
+                "csc": "$e2ee",
+                "expiry_month": str(exp_month),
+                "expiry_year": str(exp_year),
             },
+            "nonce": str(uuid.uuid4()),
+            "op": "ADD_CARD",
+            "ver": 1,
+        })
+        card_data_b64 = base64.urlsafe_b64encode(card_data_clear.encode()).rstrip(b"=").decode()
+
+        # Part 1: JWE header with PEM-format epk + base64url apv
+        eph_pem = eph_public.public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode()
+        apv_b64 = base64.urlsafe_b64encode(apv.encode()).rstrip(b"=").decode()
+        jwe_header = {
+            "alg": "ECDH-ES", "apu": "", "apv": apv_b64, "enc": "A256GCM",
+            "epk": {"crv": "P-256", "kty": "EC", "pem": eph_pem},
         }
         header_b64 = base64.urlsafe_b64encode(json.dumps(jwe_header).encode()).rstrip(b"=").decode()
         iv_b64 = base64.urlsafe_b64encode(nonce).rstrip(b"=").decode()
         ct_b64 = base64.urlsafe_b64encode(ciphertext[:-16]).rstrip(b"=").decode()
         tag_b64 = base64.urlsafe_b64encode(ciphertext[-16:]).rstrip(b"=").decode()
-        jwe_compact = f"{header_b64}..{iv_b64}.{ct_b64}.{tag_b64}"
+
+        # Meta format: card_data.jwe_header..iv.ciphertext.tag (6 parts)
+        jwe_compact = f"{card_data_b64}.{header_b64}..{iv_b64}.{ct_b64}.{tag_b64}"
 
         # 9. Wrap as trust token (signatures: [] is accepted!)
         trust_token = json.dumps({"payload": jwe_compact, "signatures": []})
