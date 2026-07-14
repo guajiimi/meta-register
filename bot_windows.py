@@ -663,11 +663,9 @@ async def step_register(page, email_addr, password, first_name, last_name,
                 if el:
                     await el.click()
                     await asyncio.sleep(0.3)
-                    await el.fill("")
-                    for ch in otp_code:
-                        await el.type(ch, delay=random.randint(50, 120))
+                    await el.fill(otp_code)
                     otp_filled = True
-                    log(f"  [5] OTP typed via {sel}")
+                    log(f"  [5] OTP filled via {sel}")
                     break
             except Exception:
                 continue
@@ -745,12 +743,9 @@ async def step_register(page, email_addr, password, first_name, last_name,
                 if el:
                     await el.click()
                     await asyncio.sleep(0.3)
-                    await el.fill("")
-                    # Type char by char for Meta's React inputs
-                    for ch in otp_code:
-                        await el.type(ch, delay=random.randint(50, 120))
+                    await el.fill(otp_code)
                     otp_filled = True
-                    log(f"  [4] OTP typed via {sel}")
+                    log(f"  [4] OTP filled via {sel}")
                     break
             except Exception:
                 continue
@@ -764,11 +759,9 @@ async def step_register(page, email_addr, password, first_name, last_name,
                     itype = await inp.get_attribute("type") or ""
                     if vis and itype in ("text", "tel", "number", ""):
                         await inp.click()
-                        await inp.fill("")
-                        for ch in otp_code:
-                            await inp.type(ch, delay=random.randint(50, 120))
+                        await inp.fill(otp_code)
                         otp_filled = True
-                        log(f"  [4] OTP typed via fallback input")
+                        log(f"  [4] OTP filled via fallback input")
                         break
                 except Exception:
                     continue
