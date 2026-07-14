@@ -11,6 +11,10 @@ from curl_cffi import requests as cffi_requests
 try:
     import nacl.public, nacl.utils
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.kdf.concatkdf import ConcatKDFHash
+    from cryptography import x509
     HAS_CRYPTO = True
 except ImportError:
     HAS_CRYPTO = False
@@ -159,8 +163,8 @@ class MetaAPI:
         self.payment_account_id = None
 
     # ── HTTP helpers ──
-    def get(self, url, **kw):
-        return self.s.get(url, proxies=self.px, allow_redirects=True, timeout=30, **kw)
+    def get(self, url, timeout=30, **kw):
+        return self.s.get(url, proxies=self.px, allow_redirects=True, timeout=timeout, **kw)
 
     def post(self, url, data=None, **kw):
         return self.s.post(url, data=data, proxies=self.px, allow_redirects=True, timeout=30, **kw)
@@ -556,26 +560,50 @@ class MetaAPI:
     # STEP 7: BILLING
     # ================================================================
     def load_billing(self):
-        """Load billing page, extract team_id and payment_account_id from HTML."""
-        r = self.get(f"{DEV_URL}/billing/")
-        self._extract(r.text)
-        html = r.text
+        """Load billing info via GraphQL and/or HTML."""
+        # First try GraphQL billing query
+        try:
+            body = self._gql(f"{DEV_URL}/api/billing/graphql/", "24332672802771817", {
+                "billableAccountID": None,
+                "paymentAccountID": None,
+            }, friendly="LLMDBillingHubPageQuery")
+            ba = (body.get("data") or {}).get("billable_account_by_asset_id") or {}
+            pa = ba.get("billing_payment_account", {})
+            if pa.get("id"):
+                self.payment_account_id = pa["id"]
+            team = ba.get("billing_team", {})
+            if team.get("id"):
+                self.team_id = team["id"]
+        except Exception:
+            pass
 
-        # team_id from redirect URL
-        m = re.search(r'[?&]team_id=(\d+)', r.url if hasattr(r, 'url') else '')
-        if m:
-            self.team_id = m.group(1)
-        
-        # team_id from HTML (server-rendered)
+        # Fallback: load billing page HTML (slower, timeout=60)
+        if not self.team_id or not self.payment_account_id:
+            try:
+                r = self.get(f"{DEV_URL}/billing/", timeout=60)
+                self._extract(r.text)
+                html = r.text
+                m = re.search(r'[?&]team_id=(\d+)', r.url if hasattr(r, 'url') else '')
+                if m:
+                    self.team_id = m.group(1)
+                if not self.team_id:
+                    m2 = re.search(r'"team":\s*\{[^}]*"id":"(\d+)"', html)
+                    if m2:
+                        self.team_id = m2.group(1)
+                m3 = re.search(r'"payment_account_id":"(\d+)"', html)
+                if m3:
+                    self.payment_account_id = m3.group(1)
+            except Exception:
+                pass
+
+        # Try another GraphQL query to get team_id
         if not self.team_id:
-            m2 = re.search(r'"team":\s*\{[^}]*"id":"(\d+)"', html)
-            if m2:
-                self.team_id = m2.group(1)
-
-        # payment_account_id from HTML
-        m3 = re.search(r'"payment_account_id":"(\d+)"', html)
-        if m3:
-            self.payment_account_id = m3.group(1)
+            try:
+                body2 = self._gql(f"{DEV_URL}/api/graphql/", "24875768768825331", {},
+                                   friendly="LLMDCTeamSettingsPageQuery")
+                self.team_id = body2.get("data", {}).get("team", {}).get("id", "")
+            except Exception:
+                pass
 
         return {"team_id": self.team_id, "payment_account_id": self.payment_account_id}
 
@@ -616,8 +644,87 @@ class MetaAPI:
         ek = (body.get("data") or {}).get("get_server_encryption_key") or {}
         return {"trust_chain": ek.get("trust_chain", []), "id": ek.get("id", "")}
 
+    def _generate_trust_token(self, card_number, cvv, exp_month, exp_year):
+        """Generate platform_trust_token via ECDH-ES + AES-256-GCM. No TPM needed."""
+        if not HAS_CRYPTO:
+            return ""
+
+        # 1. Fetch server encryption key
+        ek = self.get_encryption_key()
+        trust_chain = ek.get("trust_chain", [])
+        if not trust_chain:
+            return ""
+
+        # 2. Extract EC P-256 public key from cert
+        cert_pem = f"-----BEGIN CERTIFICATE-----\n{trust_chain[0]}\n-----END CERTIFICATE-----"
+        cert = x509.load_pem_x509_certificate(cert_pem.encode())
+        server_pubkey = cert.public_key()
+
+        # 3. Compute apv = "fp:" + base64url(SHA256(SPKI_DER))
+        spki = server_pubkey.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        spki_hash = hashes.Hash(hashes.SHA256())
+        spki_hash.update(spki)
+        apv = "fp:" + base64.urlsafe_b64encode(spki_hash.finalize()).rstrip(b"=").decode()
+
+        # 4. Generate ephemeral ECDH key pair
+        eph_private = ec.generate_private_key(ec.SECP256R1())
+        eph_public = eph_private.public_key()
+
+        # 5. ECDH key agreement
+        shared_key = eph_private.exchange(ec.ECDH(), server_pubkey)
+
+        # 6. ConcatKDF — flat format matching Meta's JS bundle
+        algorithm_id = b"\x00\x00\x00\x07A256GCM"
+        party_v_info = apv.encode()
+        other_info = algorithm_id + b"" + party_v_info + b"\x00\x00\x00\x00" + b""
+        ckdf = ConcatKDFHash(algorithm=hashes.SHA256(), length=32, otherinfo=other_info)
+        aes_key = ckdf.derive(shared_key)
+
+        # 7. Encrypt card data
+        nonce = os.urandom(12)
+        aesgcm = AESGCM(aes_key)
+        plaintext = json.dumps({
+            "data": {
+                "credit_card": card_number,
+                "csc": cvv,
+                "expiry_month": str(exp_month),
+                "expiry_year": str(exp_year),
+            },
+            "nonce": str(uuid.uuid4()),
+            "op": "ADD_CARD",
+            "ver": 1,
+        }).encode()
+        ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+
+        # 8. Build JWE compact serialization
+        eph_nums = eph_public.public_numbers()
+        jwe_header = {
+            "alg": "ECDH-ES", "enc": "A256GCM", "apu": "",
+            "apv": apv,
+            "epk": {
+                "kty": "EC", "crv": "P-256",
+                "x": base64.urlsafe_b64encode(eph_nums.x.to_bytes(32, 'big')).rstrip(b"=").decode(),
+                "y": base64.urlsafe_b64encode(eph_nums.y.to_bytes(32, 'big')).rstrip(b"=").decode(),
+            },
+        }
+        header_b64 = base64.urlsafe_b64encode(json.dumps(jwe_header).encode()).rstrip(b"=").decode()
+        iv_b64 = base64.urlsafe_b64encode(nonce).rstrip(b"=").decode()
+        ct_b64 = base64.urlsafe_b64encode(ciphertext[:-16]).rstrip(b"=").decode()
+        tag_b64 = base64.urlsafe_b64encode(ciphertext[-16:]).rstrip(b"=").decode()
+        jwe_compact = f"{header_b64}..{iv_b64}.{ct_b64}.{tag_b64}"
+
+        # 9. Wrap as trust token (signatures: [] is accepted!)
+        trust_token = json.dumps({"payload": jwe_compact, "signatures": []})
+        return base64.urlsafe_b64encode(trust_token.encode()).rstrip(b"=").decode()
+
     def save_card(self, card_number, exp_month, exp_year, cvv, name):
         """Save credit card. Returns {success, credential_id} or {error}."""
+        # Generate trust token (ECDH-ES encrypted card data)
+        trust_token = self._generate_trust_token(card_number, cvv, exp_month, exp_year)
+
         variables = {
             "input": {
                 "actor_id": self.actor_id,
@@ -627,8 +734,8 @@ class MetaAPI:
                     "cardholder_name": name,
                     "credit_card_number": {"sensitive_string_value": "$e2ee"},
                     "csc": {"sensitive_string_value": "$e2ee"},
-                    "expiry_month": exp_month,
-                    "expiry_year": f"20{exp_year}" if len(exp_year) == 2 else exp_year,
+                    "expiry_month": str(exp_month),
+                    "expiry_year": f"20{exp_year}" if len(str(exp_year)) == 2 else str(exp_year),
                     "last_4": card_number[-4:],
                 },
                 "client_info": {
@@ -640,7 +747,7 @@ class MetaAPI:
                 "country": "US",
                 "network_tokenization_consent_given": False,
                 "payment_account_id": self.payment_account_id,
-                "platform_trust_token": "",  # Empty on VPS
+                "platform_trust_token": trust_token,
                 "recurring_payment_consent_given": False,
                 "set_default": False,
                 "logging_session_data": {
