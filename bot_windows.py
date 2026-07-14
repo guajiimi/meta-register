@@ -15,7 +15,6 @@ Usage:
 
 import asyncio
 import argparse
-import email.utils as email_utils
 import imaplib
 import json
 import os
@@ -130,15 +129,46 @@ def log(msg: str):
 # ---------------------------------------------------------------------------
 # IMAP OTP reader
 # ---------------------------------------------------------------------------
+def snapshot_meta_uids() -> set:
+    """Get all current Meta email UIDs. Call BEFORE registration starts.
+    
+    Returns set of UID bytes that already exist in inbox.
+    Any email NOT in this set is guaranteed to be new.
+    """
+    uids = set()
+    try:
+        imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        imap.login(IMAP_USER, IMAP_PASS)
+        for folder in ['INBOX', '"[Gmail]/All Mail"']:
+            try:
+                imap.select(folder)
+                _, msg_nums = imap.search(
+                    None,
+                    '(OR FROM "notification@email.meta.com" '
+                    'FROM "notification@facebookmail.com")'
+                )
+                if msg_nums[0]:
+                    uids.update(msg_nums[0].split())
+            except Exception:
+                pass
+        imap.logout()
+    except Exception as e:
+        log(f"  [OTP] UID snapshot error: {e}")
+    log(f"  [OTP] Snapshot: {len(uids)} known Meta emails")
+    return uids
+
+
 def fetch_otp(email_addr: str, timeout: int = 120, poll_interval: int = 5,
-              since_ts: float | None = None) -> str | None:
-    """Poll IMAP for Meta verification code."""
+              known_uids: set | None = None) -> str | None:
+    """Poll IMAP for NEW Meta verification code.
+    
+    Uses UID-based filtering: only considers emails NOT in known_uids.
+    Bulletproof against old emails, timezone issues, date parsing failures.
+    """
     log(f"  [OTP] Waiting for verification email at {email_addr} (timeout {timeout}s)...")
     deadline = time.time() + timeout
-    if since_ts is None:
-        since_ts = time.time()
-    # Buffer: subtract 30s to avoid edge cases with clock drift
-    since_ts_buffered = since_ts - 30
+    if known_uids is None:
+        known_uids = set()
 
     while time.time() < deadline:
         try:
@@ -146,65 +176,32 @@ def fetch_otp(email_addr: str, timeout: int = 120, poll_interval: int = 5,
             imap.login(IMAP_USER, IMAP_PASS)
             imap.select("INBOX")
 
-            since_date = datetime.fromtimestamp(since_ts_buffered).strftime("%d-%b-%Y")
             _, msg_nums = imap.search(
                 None,
-                f'(UNSEEN) (OR FROM "notification@email.meta.com" '
-                f'FROM "notification@facebookmail.com") (SINCE {since_date})'
+                '(OR FROM "notification@email.meta.com" '
+                'FROM "notification@facebookmail.com")'
             )
-            if not msg_nums[0]:
-                # Fallback: All Mail
-                try:
-                    imap.select('"[Gmail]/All Mail"')
-                    _, msg_nums = imap.search(
-                        None,
-                        f'(UNSEEN) (OR FROM "notification@email.meta.com" '
-                        f'FROM "notification@facebookmail.com") (SINCE {since_date})'
-                    )
-                except Exception:
-                    pass
 
+            new_code = None
             if msg_nums[0]:
                 for num in reversed(msg_nums[0].split()):
-                    _, data = imap.fetch(num, "(BODY[HEADER.FIELDS (SUBJECT DATE)])")
+                    if num in known_uids:
+                        continue
+
+                    _, data = imap.fetch(num, "(BODY[HEADER.FIELDS (SUBJECT)])")
                     header = data[0][1].decode(errors="ignore")
-
-                    date_match = re.search(r"Date:\s*(.+)", header)
-                    if date_match:
-                        raw_date = date_match.group(1).strip()
-                        email_ts = None
-                        try:
-                            email_date = email_utils.parsedate_to_datetime(raw_date)
-                            email_ts = email_date.timestamp()
-                        except Exception:
-                            # Fallback: manual parse for common formats
-                            try:
-                                # "Tue, 14 Jul 2026 08:06:15 -0700"
-                                cleaned = re.sub(r'\s*\(.*?\)\s*$', '', raw_date)
-                                parsed = email_utils.parsedate_tz(cleaned)
-                                if parsed:
-                                    email_ts = email_utils.mktime_tz(parsed)
-                            except Exception:
-                                pass
-
-                        if email_ts is not None:
-                            if email_ts < since_ts_buffered:
-                                log(f"  [OTP] Skipping old email from {raw_date[:40]}")
-                                continue
-                        else:
-                            # Date parsing failed completely — SKIP to be safe
-                            log(f"  [OTP] SKIP: unparseable Date: {raw_date[:40]}")
-                            continue
 
                     m = re.search(r"(\d{5,8})", header)
                     if m:
-                        code = m.group(1)
+                        new_code = m.group(1)
                         imap.store(num, "+FLAGS", "\\Seen")
-                        imap.logout()
-                        log(f"  [OTP] Got code: {code}")
-                        return code
+                        log(f"  [OTP] Got NEW code: {new_code} (uid={num.decode()})")
+                        break
 
             imap.logout()
+            if new_code:
+                return new_code
+
         except Exception as e:
             log(f"  [OTP] IMAP error: {e}")
 
@@ -472,7 +469,7 @@ async def step_register(page, email_addr, password, first_name, last_name,
     except Exception:
         pass
 
-    reg_start_ts = time.time()
+    known_uids = snapshot_meta_uids()
 
     # Step 3: Enter email
     log(f"  [3] Entering email: {email_addr}")
@@ -643,7 +640,7 @@ async def step_register(page, email_addr, password, first_name, last_name,
 
         # --- Wait for OTP ---
         log("  [5] Waiting for OTP verification...")
-        otp_code = fetch_otp(email_addr, timeout=120, since_ts=reg_start_ts)
+        otp_code = fetch_otp(email_addr, timeout=120, known_uids=known_uids)
         if not otp_code:
             result["error"] = "OTP timeout - no code received"
             await take_screenshot(page, "07_otp_timeout")
@@ -727,7 +724,7 @@ async def step_register(page, email_addr, password, first_name, last_name,
           or "verification code" in page_text.lower()):
         # Direct OTP after email entry
         log("  [4] OTP screen detected after email entry")
-        otp_code = fetch_otp(email_addr, timeout=120, since_ts=reg_start_ts)
+        otp_code = fetch_otp(email_addr, timeout=120, known_uids=known_uids)
         if not otp_code:
             result["error"] = "OTP timeout after email entry"
             return result
