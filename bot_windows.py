@@ -75,7 +75,24 @@ def random_name():
 
 
 def generate_tempmail_email() -> str:
-    """Generate a fresh email via the TempMail Aggregator API."""
+    """Generate a fresh email via the TempMail Aggregator API.
+    Prefers tempmail_io and tempmail_lol (most reliable for Meta OTP)."""
+    # Try specific reliable providers first
+    for domain in ["yzcalo.com", "gmeenramy.com", "for4u.net", "blaizesmp.net", "dogmrp.com"]:
+        try:
+            resp = requests.post(
+                f"{TEMPMAIL_API_URL}/api/v1/email/generate",
+                params={"domain": domain},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                email_addr = data["email"]
+                log(f"  [TEMPMAIL] Generated email: {email_addr} (provider: {data.get('provider', '?')})")
+                return email_addr
+        except Exception:
+            continue
+    # Fallback: random provider
     resp = requests.post(f"{TEMPMAIL_API_URL}/api/v1/email/generate", timeout=10)
     resp.raise_for_status()
     data = resp.json()
@@ -279,23 +296,27 @@ async def select_combobox_option(page, combobox, option_text: str, timeout: int 
     return False
 
 
-async def dismiss_modals(page, max_rounds=5):
-    """Dismiss any 'Continue'/'OK' modals that Meta shows."""
+async def dismiss_modals(page, max_rounds=3):
+    """Dismiss 'Continue'/'OK'/'Done' modals — NOT 'Get started' (that's onboarding)."""
     for _ in range(max_rounds):
-        els = await page.evaluate("""
-            Array.from(document.querySelectorAll('*')).filter(el => {
-                const t = el.innerText?.trim();
-                return (t === 'Continue' || t === 'OK' || t === 'Get started' || t === 'Done') &&
-                       el.offsetParent !== null &&
-                       el.getBoundingClientRect().height > 20;
-            }).map(el => ({ r: el.getBoundingClientRect(), text: el.innerText.trim() }))
-        """)
-        if els:
-            e = els[0]['r']
-            await page.mouse.click(e['x'] + e['width'] / 2, e['y'] + e['height'] / 2)
-            log(f"  [MODAL] Clicked: {els[0]['text']}")
-            await asyncio.sleep(2)
-        else:
+        try:
+            els = await page.evaluate("""
+                Array.from(document.querySelectorAll('button, div[role="button"]')).filter(el => {
+                    const t = el.innerText?.trim();
+                    return (t === 'Continue' || t === 'OK' || t === 'Done' || t === 'Save') &&
+                           el.offsetParent !== null &&
+                           el.getBoundingClientRect().height > 20;
+                }).map(el => ({ r: el.getBoundingClientRect(), text: el.innerText.trim() }))
+            """)
+            if els:
+                e = els[0]['r']
+                await page.mouse.click(e['x'] + e['width'] / 2, e['y'] + e['height'] / 2)
+                log(f"  [MODAL] Clicked: {els[0]['text']}")
+                await asyncio.sleep(2)
+            else:
+                break
+        except Exception as e:
+            log(f"  [MODAL] Error: {e}")
             break
 
 
@@ -891,47 +912,52 @@ async def wait_for_redirect(page, context, timeout=60):
 # ---------------------------------------------------------------------------
 # Billing flow
 # ---------------------------------------------------------------------------
-async def complete_onboarding(page, max_steps=15):
+async def complete_onboarding(page, max_steps=10):
     """Complete the dev.meta.ai onboarding flow by clicking through all steps."""
     log("  [ONBOARDING] Completing onboarding flow...")
+    get_started_count = 0
     for step in range(max_steps):
-        url = page.url
-        # If we're no longer on onboarding, we're done
-        if "/onboarding" not in url and "/onboarding" not in (await page.evaluate("window.location.pathname")):
-            log(f"  [ONBOARDING] Completed after {step} steps. URL: {url[:80]}")
-            return True
-
-        # Try clicking various onboarding buttons
-        clicked = await page.evaluate("""
-            () => {
-                const targets = ['Get started', 'Continue', 'Next', 'Accept', 'Agree', 'Done', 'Finish'];
-                const allEls = document.querySelectorAll('button, div[role="button"], a[role="button"]');
-                for (const el of allEls) {
-                    const t = el.innerText?.trim();
-                    if (targets.includes(t) && el.offsetParent !== null && el.getBoundingClientRect().height > 20) {
-                        el.click();
-                        return t;
-                    }
-                }
-                return null;
-            }
-        """)
-        if clicked:
-            log(f"  [ONBOARDING] Step {step+1}: Clicked '{clicked}'")
-            await asyncio.sleep(3)
-        else:
-            # Maybe onboarding is done but page hasn't navigated yet
-            await asyncio.sleep(2)
-            if "/onboarding" not in page.url:
-                log(f"  [ONBOARDING] Completed (no more buttons). URL: {page.url[:80]}")
+        try:
+            url = page.url
+            # If we're no longer on onboarding, we're done
+            if "/onboarding" not in url:
+                log(f"  [ONBOARDING] Completed after {step} steps. URL: {url[:80]}")
                 return True
-            # Check if there's a text input (some onboarding steps require input)
-            has_input = await page.evaluate("!!document.querySelector('input[type=\"text\"], textarea')")
-            if has_input:
-                log(f"  [ONBOARDING] Step {step+1}: Has text input, skipping (manual step)")
+
+            # Try clicking various onboarding buttons
+            clicked = await page.evaluate("""
+                () => {
+                    const targets = ['Get started', 'Continue', 'Next', 'Accept', 'Agree', 'Done', 'Finish'];
+                    const allEls = document.querySelectorAll('button, div[role="button"], a[role="button"]');
+                    for (const el of allEls) {
+                        const t = el.innerText?.trim();
+                        if (targets.includes(t) && el.offsetParent !== null && el.getBoundingClientRect().height > 20) {
+                            el.click();
+                            return t;
+                        }
+                    }
+                    return null;
+                }
+            """)
+            if clicked:
+                # "Get started" is a dead-end modal — bail after 3 clicks
+                if clicked == "Get started":
+                    get_started_count += 1
+                    if get_started_count >= 3:
+                        log(f"  [ONBOARDING] 'Get started' clicked {get_started_count}x — likely stuck, breaking")
+                        break
+                log(f"  [ONBOARDING] Step {step+1}: Clicked '{clicked}'")
+                await asyncio.sleep(3)
+            else:
+                await asyncio.sleep(2)
+                if "/onboarding" not in page.url:
+                    log(f"  [ONBOARDING] Completed (no more buttons). URL: {page.url[:80]}")
+                    return True
+                log(f"  [ONBOARDING] No buttons found at step {step+1}, stopping")
                 break
-            log(f"  [ONBOARDING] No buttons found at step {step+1}, stopping")
-            break
+        except Exception as e:
+            log(f"  [ONBOARDING] Error at step {step+1}: {e}")
+            await asyncio.sleep(2)
 
     return "/onboarding" not in page.url
 
