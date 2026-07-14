@@ -1249,19 +1249,55 @@ async def step_api_key(page, context, project_id=None, team_id=None) -> dict:
     await create_btn.click(force=True)
     await asyncio.sleep(3)
 
-    # Fill key name
-    name_input = await page.query_selector('input[type="text"]')
-    if name_input:
-        await name_input.fill("default")
-        await human_delay(0.3, 0.7)
+    # Wait for dialog — "Create new API key" form
+    await take_screenshot(page, "14_create_key_dialog")
 
-        # Click Create button in dialog
-        submit = await page.query_selector(
-            ':is(button, [role="button"]):has-text("Create")'
-        )
-        if submit:
-            await submit.click(force=True)
-            await asyncio.sleep(5)
+    # Fill key name via label[for] (same pattern as onboarding)
+    name_filled = await page.evaluate("""
+        () => {
+            let found = false;
+            document.querySelectorAll('label').forEach(l => {
+                const t = (l.innerText || '').trim();
+                if (t === 'Key name' && l.htmlFor) {
+                    const input = document.getElementById(l.htmlFor);
+                    if (input && !input.value) {
+                        const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                        s.call(input, 'default');
+                        input.dispatchEvent(new Event('input', {bubbles: true}));
+                        input.dispatchEvent(new Event('change', {bubbles: true}));
+                        found = true;
+                    }
+                }
+            });
+            return found;
+        }
+    """)
+    if not name_filled:
+        # Fallback: fill first visible text input
+        inp = page.locator('input[type="text"]:visible').last
+        if await inp.count() > 0:
+            await inp.click()
+            await inp.press_sequentially("default", delay=50)
+    log("  [8] Key name filled: default")
+    await human_delay(0.3, 0.7)
+
+    # Click "Create API key" button INSIDE the dialog (not the page-level one)
+    # The dialog is the last visible overlay — target the last matching button
+    dialog_btn = page.locator('[role="dialog"] div[role="button"]:has-text("Create API key"), [role="dialog"] button:has-text("Create API key")')
+    if await dialog_btn.count() > 0:
+        await dialog_btn.last.click()
+        log("  [8] Clicked 'Create API key' in dialog")
+    else:
+        # Fallback: click the last "Create API key" button on page
+        all_create = page.locator('div[role="button"]:has-text("Create API key")')
+        count = await all_create.count()
+        if count > 1:
+            await all_create.last.click()
+            log(f"  [8] Clicked last 'Create API key' button ({count} found)")
+        elif count == 1:
+            await all_create.first.click()
+            log("  [8] Clicked 'Create API key' button")
+    await asyncio.sleep(5)
 
     await take_screenshot(page, "15_apikey_result")
 
