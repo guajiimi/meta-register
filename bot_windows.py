@@ -401,12 +401,15 @@ async def launch_browser(playwright, headless=False):
 # ---------------------------------------------------------------------------
 async def step_register(page, email_addr, password, first_name, last_name,
                         month, day, year) -> dict:
-    """Navigate to auth.meta.com and register a new account."""
+    """Navigate to dev.meta.ai and register a new account via OAuth."""
     result = {"status": "failed"}
 
-    # Step 1: Navigate
-    log("  [1] Navigating to auth.meta.com...")
-    await page.goto("https://auth.meta.com/", wait_until="domcontentloaded", timeout=60000)
+    # Step 1: Navigate to dev.meta.ai (NOT auth.meta.com)
+    # The OAuth flow starts from dev.meta.ai → "Use mobile number or email"
+    # → redirects to auth.meta.com for registration
+    # → redirects back to dev.meta.ai/?project_id=X&team_id=Y after success
+    log("  [1] Navigating to dev.meta.ai...")
+    await page.goto("https://dev.meta.ai/", wait_until="domcontentloaded", timeout=60000)
     await asyncio.sleep(random.uniform(3, 6))
     log(f"  [1] Current URL: {page.url}")
     await take_screenshot(page, "01_landing")
@@ -779,72 +782,74 @@ async def step_register(page, email_addr, password, first_name, last_name,
 # Post-registration: wait for redirect, extract cookies
 # ---------------------------------------------------------------------------
 async def wait_for_redirect(page, context, timeout=60):
-    """Wait for redirect to dev.meta.ai and extract cookies."""
-    log("  [6] Waiting for redirect to dev.meta.ai...")
+    """Wait for redirect back to dev.meta.ai with project_id & team_id.
+    
+    After successful registration, Meta OAuth redirects to:
+    https://dev.meta.ai/?project_id=XXX&team_id=YYY
+    """
+    log("  [6] Waiting for OAuth redirect back to dev.meta.ai...")
     cookies = {}
+    project_id = None
+    team_id = None
+
     for _ in range(timeout):
         url = page.url
-        if "dev.meta.ai" in url or "developers.facebook" in url:
-            log(f"  [6] Redirected to: {url[:80]}")
+        # Success: redirected back to dev.meta.ai with project params
+        if "dev.meta.ai" in url and "project_id" in url:
+            log(f"  [6] ✅ Redirected to dev.meta.ai with project params!")
+            pm = re.search(r"project_id=(\d+)", url)
+            tm = re.search(r"team_id=(\d+)", url)
+            if pm:
+                project_id = pm.group(1)
+            if tm:
+                team_id = tm.group(1)
+            log(f"  [6] project_id={project_id}, team_id={team_id}")
             break
-        all_cookies = await context.cookies()
-        if any(c["name"] == "c_user" for c in all_cookies):
-            log("  [6] c_user cookie found")
+        # Also accept dev.meta.ai without params (onboarding flow)
+        if "dev.meta.ai" in url and "auth.meta.com" not in url:
+            log(f"  [6] Redirected to dev.meta.ai (no project params): {url[:80]}")
             break
         await asyncio.sleep(1)
     else:
-        # Force navigate
-        log("  [6] Redirect timeout, forcing navigation to dev.meta.ai")
-        try:
-            await page.goto("https://dev.meta.ai/", wait_until="domcontentloaded", timeout=20000)
-            await asyncio.sleep(5)
-        except Exception as e:
-            log(f"  [6] Navigation error: {e}")
+        log("  [6] Redirect timeout, checking current state...")
+        log(f"  [6] Current URL: {page.url[:100]}")
 
-    # Handle any remaining modals
+    # Handle any remaining modals ("Save login info?", onboarding, etc.)
     await dismiss_modals(page)
 
-    # Extract cookies
+    # Extract ALL cookies from ALL domains
     all_cookies = await context.cookies()
     cookies = {c["name"]: c["value"] for c in all_cookies}
 
-    # If no c_user, try visiting facebook.com
-    if "c_user" not in cookies:
-        log("  [6.1] No c_user, visiting facebook.com...")
-        try:
-            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=15000)
-            await asyncio.sleep(3)
-            all_cookies = await context.cookies()
-            cookies = {c["name"]: c["value"] for c in all_cookies}
-        except Exception:
-            pass
-
-    if "c_user" not in cookies:
-        log("  [6.2] No c_user, visiting auth.meta.com...")
-        try:
-            await page.goto("https://auth.meta.com/", wait_until="domcontentloaded", timeout=15000)
-            await asyncio.sleep(3)
-            all_cookies = await context.cookies()
-            cookies = {c["name"]: c["value"] for c in all_cookies}
-        except Exception:
-            pass
-
-    # Navigate back to dev.meta.ai
+    # Navigate to dev.meta.ai if not already there
     if "dev.meta.ai" not in page.url:
         try:
-            await page.goto("https://dev.meta.ai/", wait_until="domcontentloaded", timeout=15000)
-            await asyncio.sleep(3)
-        except Exception:
-            pass
+            await page.goto("https://dev.meta.ai/", wait_until="domcontentloaded", timeout=20000)
+            await asyncio.sleep(5)
+            all_cookies = await context.cookies()
+            cookies = {c["name"]: c["value"] for c in all_cookies}
+        except Exception as e:
+            log(f"  [6] Navigation error: {e}")
 
     await dismiss_modals(page)
 
-    if "c_user" in cookies or "llm_sess" in cookies or "datr" in cookies:
+    # Extract project_id/team_id from current URL if not captured yet
+    current_url = page.url
+    if not project_id:
+        pm = re.search(r"project_id=(\d+)", current_url)
+        if pm:
+            project_id = pm.group(1)
+    if not team_id:
+        tm = re.search(r"team_id=(\d+)", current_url)
+        if tm:
+            team_id = tm.group(1)
+
+    if "llm_sess" in cookies or "datr" in cookies:
         log(f"  [6] Session cookies extracted: {sorted(cookies.keys())}")
     else:
         log(f"  [6] WARN: No session cookies found")
 
-    return cookies
+    return cookies, project_id, team_id
 
 
 # ---------------------------------------------------------------------------
@@ -1148,9 +1153,13 @@ async def register_one(context, email_addr, password, first_name, last_name,
             result["error"] = reg_result["error"]
             return result
 
-        # Extract cookies
-        cookies = await wait_for_redirect(page, context)
+        # Extract cookies + project_id/team_id from redirect URL
+        cookies, project_id, team_id = await wait_for_redirect(page, context)
         result["cookies"] = cookies
+        if project_id:
+            result["project_id"] = project_id
+        if team_id:
+            result["team_id"] = team_id
 
         if "c_user" in cookies:
             result["status"] = "registered"
