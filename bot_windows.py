@@ -931,40 +931,49 @@ async def complete_onboarding(page, max_steps=10, first_name=None, last_name=Non
 
             body = await page.evaluate("document.body?.innerText || ''")
 
+            # Bail if page errored
+            if "isn't available" in body or "unexpected error" in body:
+                log(f"  [ONBOARDING] Page error, trying reload...")
+                await page.reload(wait_until="domcontentloaded", timeout=15000)
+                await asyncio.sleep(3)
+                body = await page.evaluate("document.body?.innerText || ''")
+                if "isn't available" in body:
+                    log(f"  [ONBOARDING] Page still errored, bailing")
+                    return False
+
             # If page shows "Finish creating" form, fill it
             if "Finish creating" in body or "First name" in body:
                 log("  [ONBOARDING] API account form detected, filling...")
 
-                # Find inputs via label[for] — IDs are dynamic (_r_b_, _r_e_)
-                filled = await page.evaluate("""
-                    (args) => {
-                        let filled = {first: false, last: false};
+                # Find input IDs from label[for] — IDs are dynamic (_r_b_, _r_e_)
+                input_ids = await page.evaluate("""
+                    () => {
+                        let r = {};
                         document.querySelectorAll('label').forEach(l => {
                             const t = (l.innerText || '').trim();
-                            const forId = l.htmlFor;
-                            if (!forId) return;
-                            const input = document.getElementById(forId);
-                            if (!input) return;
-                            if (t === 'First name' && !input.value && args.firstName) {
-                                // Set value via React-compatible method
-                                const nativeSet = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-                                nativeSet.call(input, args.firstName);
-                                input.dispatchEvent(new Event('input', {bubbles: true}));
-                                input.dispatchEvent(new Event('change', {bubbles: true}));
-                                filled.first = true;
-                            }
-                            if (t === 'Last name' && !input.value && args.lastName) {
-                                const nativeSet = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-                                nativeSet.call(input, args.lastName);
-                                input.dispatchEvent(new Event('input', {bubbles: true}));
-                                input.dispatchEvent(new Event('change', {bubbles: true}));
-                                filled.last = true;
-                            }
+                            if (t === 'First name') r.first = l.htmlFor;
+                            if (t === 'Last name') r.last = l.htmlFor;
                         });
-                        return filled;
+                        return r;
                     }
-                """, {"firstName": first_name or "Alex", "lastName": last_name or "Smith"})
-                log(f"  [ONBOARDING] Filled: {filled}")
+                """)
+
+                fname = first_name or "Alex"
+                lname = last_name or "Smith"
+
+                if input_ids.get("first"):
+                    inp = page.locator(f"#{input_ids['first']}")
+                    await inp.click()
+                    await inp.press_sequentially(fname, delay=50)
+                    log(f"  [ONBOARDING] Typed first name: {fname}")
+
+                if input_ids.get("last"):
+                    inp = page.locator(f"#{input_ids['last']}")
+                    await inp.click()
+                    await inp.press_sequentially(lname, delay=50)
+                    log(f"  [ONBOARDING] Typed last name: {lname}")
+
+                await asyncio.sleep(1)
 
             # Click submit button
             clicked = await page.evaluate("""
