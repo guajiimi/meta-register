@@ -904,23 +904,13 @@ async def complete_onboarding(page, max_steps=15):
         # Try clicking various onboarding buttons
         clicked = await page.evaluate("""
             () => {
-                const selectors = [
-                    'button:has-text("Get started")',
-                    'button:has-text("Continue")',
-                    'button:has-text("Next")',
-                    'button:has-text("Accept")',
-                    'button:has-text("Agree")',
-                    'button:has-text("Done")',
-                    'button:has-text("Finish")',
-                    'div[role="button"]:has-text("Get started")',
-                    'div[role="button"]:has-text("Continue")',
-                    'div[role="button"]:has-text("Next")',
-                ];
-                for (const sel of selectors) {
-                    const el = document.querySelector(sel);
-                    if (el && el.offsetParent !== null) {
+                const targets = ['Get started', 'Continue', 'Next', 'Accept', 'Agree', 'Done', 'Finish'];
+                const allEls = document.querySelectorAll('button, div[role="button"], a[role="button"]');
+                for (const el of allEls) {
+                    const t = el.innerText?.trim();
+                    if (targets.includes(t) && el.offsetParent !== null && el.getBoundingClientRect().height > 20) {
                         el.click();
-                        return el.innerText.trim();
+                        return t;
                     }
                 }
                 return null;
