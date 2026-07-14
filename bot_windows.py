@@ -137,6 +137,8 @@ def fetch_otp(email_addr: str, timeout: int = 120, poll_interval: int = 5,
     deadline = time.time() + timeout
     if since_ts is None:
         since_ts = time.time()
+    # Buffer: subtract 30s to avoid edge cases with clock drift
+    since_ts_buffered = since_ts - 30
 
     while time.time() < deadline:
         try:
@@ -144,10 +146,10 @@ def fetch_otp(email_addr: str, timeout: int = 120, poll_interval: int = 5,
             imap.login(IMAP_USER, IMAP_PASS)
             imap.select("INBOX")
 
-            since_date = datetime.fromtimestamp(since_ts).strftime("%d-%b-%Y")
+            since_date = datetime.fromtimestamp(since_ts_buffered).strftime("%d-%b-%Y")
             _, msg_nums = imap.search(
                 None,
-                f'(OR FROM "notification@email.meta.com" '
+                f'(UNSEEN) (OR FROM "notification@email.meta.com" '
                 f'FROM "notification@facebookmail.com") (SINCE {since_date})'
             )
             if not msg_nums[0]:
@@ -156,7 +158,7 @@ def fetch_otp(email_addr: str, timeout: int = 120, poll_interval: int = 5,
                     imap.select('"[Gmail]/All Mail"')
                     _, msg_nums = imap.search(
                         None,
-                        f'(OR FROM "notification@email.meta.com" '
+                        f'(UNSEEN) (OR FROM "notification@email.meta.com" '
                         f'FROM "notification@facebookmail.com") (SINCE {since_date})'
                     )
                 except Exception:
@@ -173,10 +175,11 @@ def fetch_otp(email_addr: str, timeout: int = 120, poll_interval: int = 5,
                             email_date = email_lib.utils.parsedate_to_datetime(
                                 date_match.group(1).strip()
                             )
-                            if email_date.timestamp() < since_ts:
+                            if email_date.timestamp() < since_ts_buffered:
+                                log(f"  [OTP] Skipping old email from {email_date.isoformat()} (need >= {datetime.fromtimestamp(since_ts_buffered).isoformat()})")
                                 continue
                         except Exception:
-                            pass
+                            log(f"  [OTP] Warning: could not parse Date header: {date_match.group(1).strip()[:60]}")
 
                     m = re.search(r"(\d{5,8})", header)
                     if m:
@@ -759,7 +762,10 @@ async def step_register(page, email_addr, password, first_name, last_name,
 
     # Step 5.5: Handle post-login dialogs
     log("  [5.5] Checking for post-login dialogs...")
-    for _round in range(5):
+    dialog_progress = False
+    for _round in range(2):
+        pre_url = page.url
+        round_clicked = False
         for text in ["Save", "OK", "Continue", "Yes", "Allow", "Confirm", "Next", "Done"]:
             sel = f'div[role="button"]:has-text("{text}")'
             try:
@@ -769,12 +775,33 @@ async def step_register(page, email_addr, password, first_name, last_name,
                     if box and box["height"] > 20:
                         await el.click(force=True)
                         log(f"  [5.5] Clicked: {text}")
+                        round_clicked = True
                         await asyncio.sleep(2)
             except Exception:
                 continue
         await asyncio.sleep(2)
+        if round_clicked:
+            dialog_progress = True
+        # If URL didn't change after clicking dialogs, likely stuck on auth page
+        if "auth.meta.com" in page.url and page.url == pre_url and round_clicked:
+            log("  [5.5] Still on auth.meta.com after clicking dialog — OTP may have failed")
+            break
+        if not round_clicked:
+            break  # No buttons found, no point continuing
 
-    result["status"] = "success"
+    # Check if we actually succeeded: llm_sess cookie or landed on dev.meta.ai
+    current_url = page.url
+    try:
+        page_cookies = {c["name"]: c["value"] for c in await page.context.cookies()}
+    except Exception:
+        page_cookies = {}
+    if "llm_sess" in page_cookies or "dev.meta.ai" in current_url:
+        result["status"] = "success"
+    elif "auth.meta.com" in current_url:
+        result["status"] = "failed"
+        result["error"] = "Still on auth.meta.com after OTP — likely wrong code"
+    else:
+        result["status"] = "success"
     return result
 
 
@@ -844,8 +871,10 @@ async def wait_for_redirect(page, context, timeout=60):
         if tm:
             team_id = tm.group(1)
 
-    if "llm_sess" in cookies or "datr" in cookies:
-        log(f"  [6] Session cookies extracted: {sorted(cookies.keys())}")
+    if "llm_sess" in cookies:
+        log(f"  [6] Session cookies extracted (llm_sess found): {sorted(cookies.keys())}")
+    elif "dev.meta.ai" in page.url:
+        log(f"  [6] On dev.meta.ai — registration appears successful. Cookies: {sorted(cookies.keys())}")
     else:
         log(f"  [6] WARN: No session cookies found")
 
@@ -1168,12 +1197,13 @@ async def register_one(context, email_addr, password, first_name, last_name,
         elif "llm_sess" in cookies:
             result["status"] = "registered"
             log(f"  ✅ REGISTERED! llm_sess found")
-        elif "datr" in cookies:
+        elif "dev.meta.ai" in page.url:
             result["status"] = "registered"
-            log(f"  ✅ REGISTERED! datr found")
+            log(f"  ✅ REGISTERED! on dev.meta.ai (no llm_sess/c_user but landed correctly)")
         else:
-            result["status"] = "registered"
-            log(f"  ⚠️ Registered but no session cookies found")
+            result["status"] = "failed"
+            result["error"] = "Registration unconfirmed — no llm_sess cookie and not on dev.meta.ai"
+            log(f"  ❌ Registration unconfirmed: cookies={sorted(cookies.keys())}, url={page.url[:80]}")
 
         await take_screenshot(page, "09_registered")
 
