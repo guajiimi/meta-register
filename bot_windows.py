@@ -171,15 +171,30 @@ def fetch_otp(email_addr: str, timeout: int = 120, poll_interval: int = 5,
 
                     date_match = re.search(r"Date:\s*(.+)", header)
                     if date_match:
+                        raw_date = date_match.group(1).strip()
+                        email_ts = None
                         try:
-                            email_date = email_lib.utils.parsedate_to_datetime(
-                                date_match.group(1).strip()
-                            )
-                            if email_date.timestamp() < since_ts_buffered:
-                                log(f"  [OTP] Skipping old email from {email_date.isoformat()} (need >= {datetime.fromtimestamp(since_ts_buffered).isoformat()})")
-                                continue
+                            email_date = email_lib.utils.parsedate_to_datetime(raw_date)
+                            email_ts = email_date.timestamp()
                         except Exception:
-                            log(f"  [OTP] Warning: could not parse Date header: {date_match.group(1).strip()[:60]}")
+                            # Fallback: manual parse for common formats
+                            try:
+                                # "Tue, 14 Jul 2026 08:06:15 -0700"
+                                cleaned = re.sub(r'\s*\(.*?\)\s*$', '', raw_date)
+                                parsed = email_lib.utils.parsedate_tz(cleaned)
+                                if parsed:
+                                    email_ts = email_lib.utils.mktime_tz(parsed)
+                            except Exception:
+                                pass
+
+                        if email_ts is not None:
+                            if email_ts < since_ts_buffered:
+                                log(f"  [OTP] Skipping old email from {raw_date[:40]}")
+                                continue
+                        else:
+                            # Date parsing failed completely — SKIP to be safe
+                            log(f"  [OTP] SKIP: unparseable Date: {raw_date[:40]}")
+                            continue
 
                     m = re.search(r"(\d{5,8})", header)
                     if m:
