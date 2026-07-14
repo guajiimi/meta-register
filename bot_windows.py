@@ -39,6 +39,7 @@ IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
 IMAP_USER = os.getenv("IMAP_USER", "")
 IMAP_PASS = os.getenv("IMAP_PASS", "")
 BASE_GMAIL = os.getenv("BASE_GMAIL", "").strip()
+EMAIL_DOMAINS = [d.strip() for d in os.getenv("EMAIL_DOMAINS", "guajimi.social").split(",")]
 PROXY_URL = os.getenv("PROXY_URL", "")
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", str(SCRIPT_DIR / "data" / "output")))
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", str(SCRIPT_DIR / "data" / "screenshots")))
@@ -79,26 +80,12 @@ def random_name():
 
 
 def random_email(first: str, last: str) -> str:
-    """Generate a unique email using Gmail dot-trick or fallback domain."""
-    if BASE_GMAIL and "@gmail.com" in BASE_GMAIL.lower():
-        local, domain = BASE_GMAIL.split("@", 1)
-        chars = [c for c in local if c != "."]
-        gaps = len(chars) - 1
-        while True:
-            mask = [random.random() < 0.5 for _ in range(gaps)]
-            if any(mask):
-                break
-        out = chars[0]
-        for i, c in enumerate(chars[1:]):
-            if mask[i]:
-                out += "."
-            out += c
-        return f"{out}@{domain}"
-    # Fallback
-    sep = random.choice([".", "_", ""])
-    num = random.randint(1, 999)
-    user = f"{first.lower()}{sep}{last.lower()}{num}"
-    return f"{user}@gmail.com"
+    """Generate a unique email using custom domain (no dot-trick dedup)."""
+    # Use custom domain — each address is truly unique, no Meta dedup
+    domain = random.choice(EMAIL_DOMAINS)
+    # Random alphanumeric prefix (12 chars)
+    prefix = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    return f"{prefix}@{domain}"
 
 
 def random_birthday() -> tuple:
