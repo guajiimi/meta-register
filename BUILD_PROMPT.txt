@@ -1,0 +1,41 @@
+Add network request/response interception to the Meta AI registration bot (/root/meta-register/bot_windows.py).
+
+## Goal
+Capture ALL network requests during registration, billing, and API key creation flows to reverse-engineer Meta's internal APIs.
+
+## What to Add
+
+### 1. Network Logger Class
+Add a `NetworkLogger` class that captures:
+- URL, method, headers (especially authorization, x-fb-lsd, content-type)
+- Request body (POST/PUT)
+- Response status, headers, body
+- Filter: only capture requests to `meta.com`, `facebook.com`, `fbcdn.net` domains
+- Skip static assets (images, fonts, CSS, JS bundles)
+- Save to `/root/meta-register/data/network/capture_{timestamp}.json`
+
+### 2. Attach to Browser Context
+In the main `run_registrations()` function, attach the logger to the browser context using `page.on("request", ...)` and `page.on("response", ...)`.
+
+### 3. Key Flows to Intercept
+Focus on capturing these API calls:
+- Registration: `auth.meta.com` GraphQL mutations (account creation, OTP verification)
+- Billing: `dev.meta.ai/billing` Stripe/card submission 
+- API key creation: `dev.meta.ai/api-keys` GraphQL mutations
+- OAuth: `auth.meta.com/oidc/*` token exchange
+
+### 4. Also Capture JS Bundle URLs
+Log all loaded JS bundle URLs from `dev.meta.ai` so we can download and analyze them later.
+
+### 5. HAR Format Output
+Save the full capture in a format that can be loaded in browser DevTools (HAR-like JSON).
+
+## Implementation Notes
+- Use `page.on("request", handler)` and `page.on("response", handler)` 
+- For POST requests, call `request.post_data` to get body
+- For responses, call `response.json()` or `response.text()` to get body
+- Some responses may fail to read (opaque responses, CORS) — handle gracefully
+- The logger should NOT slow down the bot — use async handlers
+- Create the output directory: `/root/meta-register/data/network/`
+- After the flow completes, save all captured data to a single JSON file
+- Add a `--capture` CLI flag to enable/disable network logging (default: enabled)

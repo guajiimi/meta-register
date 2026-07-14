@@ -25,6 +25,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -38,9 +39,11 @@ TEMPMAIL_API_URL = os.getenv("TEMPMAIL_API_URL", "http://localhost:8096")
 PROXY_URL = os.getenv("PROXY_URL", "")
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", str(SCRIPT_DIR / "data" / "output")))
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", str(SCRIPT_DIR / "data" / "screenshots")))
+NETWORK_DIR = Path(os.getenv("NETWORK_DIR", str(SCRIPT_DIR / "data" / "network")))
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+NETWORK_DIR.mkdir(parents=True, exist_ok=True)
 
 # Card details
 CARD_NUMBER = "4889501032758307"
@@ -174,6 +177,241 @@ def fetch_tempmail_otp(email_addr: str, timeout: int = 120,
 
     log("  [OTP] Timeout — no OTP received")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Network Logger — captures all Meta-domain API traffic
+# ---------------------------------------------------------------------------
+class NetworkLogger:
+    """Captures all network requests/responses to Meta domains during registration.
+
+    Saves HAR-like JSON for reverse-engineering Meta's internal APIs.
+    Usage:
+        logger = NetworkLogger()
+        logger.attach(page)      # start capturing
+        ...                      # do registration
+        logger.save()            # write capture file
+    """
+
+    # Domains to capture
+    CAPTURE_DOMAINS = (
+        "meta.com", "facebook.com", "fbcdn.net",
+        "meta.ai", "dev.meta.ai", "auth.meta.com",
+    )
+
+    # Static asset extensions to skip
+    SKIP_EXTENSIONS = frozenset((
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
+        ".woff", ".woff2", ".ttf", ".eot", ".otf",
+        ".css", ".map",
+        ".mp4", ".webm", ".mp3", ".wav",
+    ))
+
+    # JS bundle path patterns to log separately
+    JS_BUNDLE_PATTERNS = ("/static/", "/assets/", "/_next/", "/build/", "/chunks/")
+
+    def __init__(self, output_dir: Path | None = None):
+        self._entries: list[dict] = []
+        self._js_bundles: list[str] = []
+        self._pending: dict[int, dict] = {}  # request id → entry (waiting for response)
+        self._attached_pages: list = []
+        self._output_dir = output_dir or NETWORK_DIR
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._start_time = datetime.now()
+
+    # ---- public API ----------------------------------------------------------
+
+    def attach(self, page):
+        """Attach request/response listeners to a Playwright page."""
+        page.on("request", self._on_request)
+        page.on("response", self._on_response)
+        self._attached_pages.append(page)
+        log("  [NET] Network logger attached to page")
+
+    def save(self) -> str:
+        """Save all captured data to a HAR-like JSON file. Returns the file path."""
+        ts = self._start_time.strftime("%Y%m%d_%H%M%S")
+        out_path = self._output_dir / f"capture_{ts}.json"
+
+        har = {
+            "log": {
+                "version": "1.2",
+                "creator": {
+                    "name": "meta-register-bot",
+                    "version": "1.0",
+                },
+                "startedDateTime": self._start_time.isoformat(),
+                "endedDateTime": datetime.now().isoformat(),
+                "entries": self._entries,
+            },
+            "jsBundles": sorted(set(self._js_bundles)),
+            "summary": {
+                "totalRequests": len(self._entries),
+                "graphqlMutations": [e for e in self._entries if e.get("category") == "graphql"],
+                "authRequests": [e for e in self._entries if e.get("category") == "auth"],
+                "billingRequests": [e for e in self._entries if e.get("category") == "billing"],
+                "oauthRequests": [e for e in self._entries if e.get("category") == "oauth"],
+                "jsBundleUrls": sorted(set(self._js_bundles)),
+            },
+        }
+
+        with open(out_path, "w") as f:
+            json.dump(har, f, indent=2, default=str)
+
+        log(f"  [NET] Saved {len(self._entries)} entries + {len(self._js_bundles)} JS bundles → {out_path}")
+        return str(out_path)
+
+    @property
+    def entry_count(self) -> int:
+        return len(self._entries)
+
+    # ---- internal handlers ---------------------------------------------------
+
+    def _should_capture(self, url: str) -> bool:
+        """Return True if this URL should be captured."""
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ""
+
+        # Must be a Meta domain
+        if not any(hostname.endswith(d) for d in self.CAPTURE_DOMAINS):
+            return False
+
+        # Skip static assets by extension
+        path_lower = parsed.path.lower()
+        if any(path_lower.endswith(ext) for ext in self.SKIP_EXTENSIONS):
+            # But still track JS bundles
+            if path_lower.endswith((".js", ".mjs")) and any(p in path_lower for p in self.JS_BUNDLE_PATTERNS):
+                self._js_bundles.append(url)
+            return False
+
+        # Skip data: and blob: URLs
+        if parsed.scheme in ("data", "blob"):
+            return False
+
+        return True
+
+    def _categorize(self, url: str, method: str) -> str:
+        """Categorize a request by its URL pattern."""
+        if "auth.meta.com/oidc" in url or "auth.meta.com/oauth" in url:
+            return "oauth"
+        if "auth.meta.com" in url and method == "POST":
+            return "auth"
+        if "billing/graphql" in url or ("/billing" in url and method == "POST"):
+            return "billing"
+        if "graphql" in url and method == "POST":
+            return "graphql"
+        if "api-keys" in url and method == "POST":
+            return "api_key"
+        return "other"
+
+    async def _on_request(self, request):
+        """Handle a new request — capture metadata and body."""
+        url = request.url
+
+        # Track JS bundle URLs from dev.meta.ai regardless of capture filter
+        parsed = urlparse(url)
+        if parsed.hostname and parsed.hostname.endswith("meta.ai"):
+            path_lower = parsed.path.lower()
+            if path_lower.endswith((".js", ".mjs")):
+                self._js_bundles.append(url)
+
+        if not self._should_capture(url):
+            return
+
+        entry = {
+            "request": {
+                "method": request.method,
+                "url": url,
+                "headers": dict(request.headers),
+                "postData": None,
+            },
+            "response": None,
+            "category": self._categorize(url, request.method),
+            "startedDateTime": datetime.now().isoformat(),
+        }
+
+        # Capture POST/PUT body
+        if request.method in ("POST", "PUT", "PATCH"):
+            try:
+                post_data = request.post_data
+                if post_data:
+                    # Try to parse as JSON or form data
+                    entry["request"]["postData"] = {
+                        "mimeType": request.headers.get("content-type", ""),
+                        "text": post_data,
+                    }
+            except Exception:
+                pass
+
+        # Store keyed by a stable id (use the request object's internal id)
+        req_id = id(request)
+        self._pending[req_id] = entry
+
+    async def _on_response(self, response):
+        """Handle a response — capture status, headers, body."""
+        request = response.request
+        url = response.url
+        if not self._should_capture(url):
+            return
+
+        req_id = id(request)
+        entry = self._pending.pop(req_id, None)
+        if entry is None:
+            # Response without a matched request (shouldn't happen, but be safe)
+            entry = {
+                "request": {
+                    "method": request.method,
+                    "url": url,
+                    "headers": dict(request.headers),
+                    "postData": None,
+                },
+                "category": self._categorize(url, request.method),
+                "startedDateTime": datetime.now().isoformat(),
+            }
+
+        entry["response"] = {
+            "status": response.status,
+            "statusText": response.status_text,
+            "headers": dict(response.headers),
+            "body": None,
+            "bodySize": 0,
+        }
+        entry["time"] = datetime.now().isoformat()
+
+        # Try to read response body (may fail for opaque/CORS responses)
+        content_type = response.headers.get("content-type", "")
+        try:
+            if "json" in content_type or "text" in content_type or "graphql" in content_type:
+                body_text = await response.text()
+                entry["response"]["bodySize"] = len(body_text)
+
+                # Strip FB's "for (;;);" prefix if present
+                if body_text.startswith("for (;;);"):
+                    body_text = body_text[len("for (;;);"):]
+
+                # Try to parse as JSON
+                if "json" in content_type or body_text.strip().startswith(("{", "[")):
+                    try:
+                        entry["response"]["body"] = json.loads(body_text)
+                    except (json.JSONDecodeError, ValueError):
+                        entry["response"]["body"] = body_text
+                else:
+                    entry["response"]["body"] = body_text
+            else:
+                entry["response"]["bodySize"] = int(response.headers.get("content-length", 0))
+        except Exception:
+            # Opaque response, CORS error, connection reset, etc.
+            entry["response"]["body"] = "<unreadable>"
+
+        self._entries.append(entry)
+
+        # Log interesting requests inline
+        cat = entry.get("category", "")
+        if cat in ("graphql", "auth", "billing", "oauth", "api_key"):
+            status = entry["response"]["status"]
+            method = entry["request"]["method"]
+            short_url = url.split("?")[0][:80]
+            log(f"  [NET] {method} {short_url} → {status} [{cat}]")
 
 
 # ---------------------------------------------------------------------------
@@ -1378,7 +1616,8 @@ async def step_api_key(page, context, project_id=None, team_id=None) -> dict:
 # Single registration + full flow
 # ---------------------------------------------------------------------------
 async def register_one(context, email_addr, password, first_name, last_name,
-                       month, day, year, do_billing=True, do_apikey=True) -> dict:
+                       month, day, year, do_billing=True, do_apikey=True,
+                       network_logger: NetworkLogger | None = None) -> dict:
     """Attempt full flow: register → OTP → billing → API key."""
     result = {
         "email": email_addr,
@@ -1391,6 +1630,11 @@ async def register_one(context, email_addr, password, first_name, last_name,
     }
 
     page = await context.new_page()
+
+    # Attach network logger if provided
+    if network_logger:
+        network_logger.attach(page)
+
     try:
         # Registration
         reg_result = await step_register(
@@ -1485,7 +1729,8 @@ async def register_one(context, email_addr, password, first_name, last_name,
 # Main runner
 # ---------------------------------------------------------------------------
 async def run_registrations(count: int, headless: bool = False,
-                            do_billing: bool = True, do_apikey: bool = True):
+                            do_billing: bool = True, do_apikey: bool = True,
+                            capture_network: bool = True):
     """Main registration loop."""
     from playwright.async_api import async_playwright
 
@@ -1500,6 +1745,7 @@ async def run_registrations(count: int, headless: bool = False,
     log(f"Headless: {headless}")
     log(f"Billing: {do_billing}")
     log(f"API Key: {do_apikey}")
+    log(f"Network Capture: {capture_network}")
     log(f"Output: {output_file}")
     log(f"{'=' * 60}\n")
 
@@ -1513,6 +1759,9 @@ async def run_registrations(count: int, headless: bool = False,
             log(f"\n[{i + 1}/{count}] Registering: {first} {last} <{email_addr}>")
             log(f"  Birthday: {month} {day}, {year}")
 
+            # Create per-registration network logger
+            net_logger = NetworkLogger() if capture_network else None
+
             max_retries = 2
             for attempt in range(max_retries + 1):
                 try:
@@ -1523,6 +1772,7 @@ async def run_registrations(count: int, headless: bool = False,
                             month, day, year,
                             do_billing=do_billing,
                             do_apikey=do_apikey,
+                            network_logger=net_logger,
                         )
                     finally:
                         await context.close()
@@ -1546,6 +1796,12 @@ async def run_registrations(count: int, headless: bool = False,
                             "timestamp": datetime.now().isoformat(),
                         })
                     await asyncio.sleep(random.uniform(5, 10))
+
+            # Save network capture for this registration
+            if net_logger and net_logger.entry_count > 0:
+                capture_path = net_logger.save()
+                result["network_capture"] = capture_path
+                log(f"  [NET] {net_logger.entry_count} requests captured for this registration")
 
             # Delay between registrations
             if i < count - 1:
@@ -1598,6 +1854,10 @@ def main():
                      help="Skip billing/payment step")
     reg.add_argument("--no-apikey", action="store_true", default=False,
                      help="Skip API key creation step")
+    reg.add_argument("--capture", action="store_true", default=True,
+                     help="Enable network request capture (default: on)")
+    reg.add_argument("--no-capture", dest="capture", action="store_false",
+                     help="Disable network request capture")
 
     args = parser.parse_args()
 
@@ -1606,7 +1866,8 @@ def main():
         do_billing = not args.no_billing
         do_apikey = not args.no_apikey
         asyncio.run(run_registrations(args.count, headless=headless,
-                                      do_billing=do_billing, do_apikey=do_apikey))
+                                      do_billing=do_billing, do_apikey=do_apikey,
+                                      capture_network=args.capture))
     else:
         parser.print_help()
 
