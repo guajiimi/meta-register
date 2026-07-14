@@ -912,25 +912,60 @@ async def wait_for_redirect(page, context, timeout=60):
 # ---------------------------------------------------------------------------
 # Billing flow
 # ---------------------------------------------------------------------------
-async def complete_onboarding(page, max_steps=10):
-    """Complete the dev.meta.ai onboarding flow by clicking through all steps."""
+async def complete_onboarding(page, max_steps=10, first_name=None, last_name=None):
+    """Complete the dev.meta.ai onboarding flow.
+    
+    The onboarding page is a 'Finish creating your Model API account' form:
+    - First name input
+    - Last name input
+    - Marketing checkbox (optional)
+    - 'Get started' submit button
+    """
     log("  [ONBOARDING] Completing onboarding flow...")
-    get_started_count = 0
     for step in range(max_steps):
         try:
             url = page.url
-            # If we're no longer on onboarding, we're done
             if "/onboarding" not in url:
                 log(f"  [ONBOARDING] Completed after {step} steps. URL: {url[:80]}")
                 return True
 
-            # Try clicking various onboarding buttons
+            body = await page.evaluate("document.body?.innerText || ''")
+
+            # If page shows "Finish creating" form, fill it
+            if "Finish creating" in body or "First name" in body:
+                log("  [ONBOARDING] API account form detected, filling...")
+
+                # Fill first name if empty
+                fname_input = await page.query_selector('input[aria-label="First name"], input[name="first_name"], input[placeholder*="First"]')
+                if fname_input:
+                    val = await fname_input.input_value()
+                    if not val and first_name:
+                        await fname_input.fill(first_name)
+                        log(f"  [ONBOARDING] Filled first name: {first_name}")
+                    elif not val:
+                        await fname_input.fill("Alex")
+                        log("  [ONBOARDING] Filled first name: Alex (default)")
+
+                # Fill last name if empty
+                lname_input = await page.query_selector('input[aria-label="Last name"], input[name="last_name"], input[placeholder*="Last"]')
+                if lname_input:
+                    val = await lname_input.input_value()
+                    if not val and last_name:
+                        await lname_input.fill(last_name)
+                        log(f"  [ONBOARDING] Filled last name: {last_name}")
+                    elif not val:
+                        await lname_input.fill("Smith")
+                        log("  [ONBOARDING] Filled last name: Smith (default)")
+
+                await asyncio.sleep(1)
+
+            # Click submit button
             clicked = await page.evaluate("""
                 () => {
-                    const targets = ['Get started', 'Continue', 'Next', 'Accept', 'Agree', 'Done', 'Finish'];
+                    const targets = ['Get started', 'Continue', 'Next', 'Accept', 'Agree', 'Done', 'Finish', 'Submit'];
                     const allEls = document.querySelectorAll('button, div[role="button"], a[role="button"]');
                     for (const el of allEls) {
-                        const t = el.innerText?.trim();
+                        const t = (el.innerText || '').trim();
                         if (targets.includes(t) && el.offsetParent !== null && el.getBoundingClientRect().height > 20) {
                             el.click();
                             return t;
@@ -940,20 +975,13 @@ async def complete_onboarding(page, max_steps=10):
                 }
             """)
             if clicked:
-                # "Get started" is a dead-end modal — bail after 3 clicks
-                if clicked == "Get started":
-                    get_started_count += 1
-                    if get_started_count >= 3:
-                        log(f"  [ONBOARDING] 'Get started' clicked {get_started_count}x — likely stuck, breaking")
-                        break
                 log(f"  [ONBOARDING] Step {step+1}: Clicked '{clicked}'")
-                await asyncio.sleep(3)
+                await asyncio.sleep(4)
             else:
                 await asyncio.sleep(2)
                 if "/onboarding" not in page.url:
-                    log(f"  [ONBOARDING] Completed (no more buttons). URL: {page.url[:80]}")
                     return True
-                log(f"  [ONBOARDING] No buttons found at step {step+1}, stopping")
+                log(f"  [ONBOARDING] No buttons at step {step+1}, stopping")
                 break
         except Exception as e:
             log(f"  [ONBOARDING] Error at step {step+1}: {e}")
@@ -967,7 +995,7 @@ async def step_billing(page, context, first_name, last_name, project_id=None, te
     result = {"status": "failed"}
 
     # Complete onboarding first
-    await complete_onboarding(page)
+    await complete_onboarding(page, first_name=first_name, last_name=last_name)
     await asyncio.sleep(2)
 
     # Build billing URL with project_id and team_id if available
@@ -987,7 +1015,7 @@ async def step_billing(page, context, first_name, last_name, project_id=None, te
 
     # Complete onboarding again if redirected
     if "/onboarding" in page.url:
-        await complete_onboarding(page)
+        await complete_onboarding(page, first_name=first_name, last_name=last_name)
         await asyncio.sleep(2)
         if project_id and team_id:
             await page.goto(billing_url_target, wait_until="domcontentloaded", timeout=30000)
