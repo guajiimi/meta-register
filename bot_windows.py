@@ -15,7 +15,7 @@ Usage:
 
 import asyncio
 import argparse
-import email as email_lib
+import email.utils as email_utils
 import imaplib
 import json
 import os
@@ -174,16 +174,16 @@ def fetch_otp(email_addr: str, timeout: int = 120, poll_interval: int = 5,
                         raw_date = date_match.group(1).strip()
                         email_ts = None
                         try:
-                            email_date = email_lib.utils.parsedate_to_datetime(raw_date)
+                            email_date = email_utils.parsedate_to_datetime(raw_date)
                             email_ts = email_date.timestamp()
                         except Exception:
                             # Fallback: manual parse for common formats
                             try:
                                 # "Tue, 14 Jul 2026 08:06:15 -0700"
                                 cleaned = re.sub(r'\s*\(.*?\)\s*$', '', raw_date)
-                                parsed = email_lib.utils.parsedate_tz(cleaned)
+                                parsed = email_utils.parsedate_tz(cleaned)
                                 if parsed:
-                                    email_ts = email_lib.utils.mktime_tz(parsed)
+                                    email_ts = email_utils.mktime_tz(parsed)
                             except Exception:
                                 pass
 
