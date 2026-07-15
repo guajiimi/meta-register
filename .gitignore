@@ -33,3 +33,4 @@ try_apikey.py
 wg-*.conf
 bot.py
 data/network/
+session.json
