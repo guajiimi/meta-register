@@ -1,0 +1,30 @@
+{
+  "email": "doe3e3903@d.airfryersbg.com",
+  "password": "TestPass123!",
+  "actor_id": "1319878204533087",
+  "team_id": "2127795258138762",
+  "payment_account_id": "2127795261472095",
+  "project_id": "1551090059789021",
+  "cookies": {
+    ".auth.meta.com": {
+      "datr": "Bd5WakfXjnW_YwvpyI6eRCND",
+      "ps_l": "1",
+      "ps_n": "1",
+      "fs": "FpSyovWCm9gEFlYYDm40TG1BV1lCbWhNV3NRFpz4tqUNGAAA",
+      "locale": "en_US",
+      "dbln": "%7B%221319878204533087%22%3A%22o4Az6uYB%22%7D"
+    },
+    ".meta.ai": {
+      "datr": "Hd5Wavf1ldKdwzzMyRPxbSI-",
+      "ps_l": "0",
+      "ps_n": "0",
+      "wd": "1280x720"
+    },
+    ".dev.meta.ai": {
+      "llm_sess": "FsrGjMPcy7sEFkIYDkxhTDM2X1MyRjdUd0FBFsT4tqUNGAAA"
+    }
+  },
+  "fb_dtsg": "NAfwZGEEU6YtCNmCpzXE8gG2x1ZrC-2hfFq2CyeUNV0yWANBDV6gEiA:33:1784077858",
+  "lsd": "MafvNx4BMG2munmVxMX3Xr",
+  "has_session": true
+}

@@ -161,6 +161,7 @@ class MetaAPI:
         self.account_id = None
         self.team_id = None
         self.payment_account_id = None
+        self.project_id = None
 
     # ── HTTP helpers ──
     def get(self, url, timeout=30, **kw):
@@ -574,6 +575,12 @@ class MetaAPI:
             team = ba.get("billing_team", {})
             if team.get("id"):
                 self.team_id = team["id"]
+            # Try to extract project_id from billing response
+            if ba.get("project_id"):
+                self.project_id = str(ba["project_id"])
+            elif ba.get("id") and not self.project_id:
+                # project_id may equal the billable account id
+                self.project_id = str(ba["id"])
         except Exception:
             pass
 
@@ -590,6 +597,13 @@ class MetaAPI:
                     m2 = re.search(r'"team":\s*\{[^}]*"id":"(\d+)"', html)
                     if m2:
                         self.team_id = m2.group(1)
+                m_p = re.search(r'[?&]project_id=(\d+)', r.url if hasattr(r, 'url') else '')
+                if m_p:
+                    self.project_id = m_p.group(1)
+                if not self.project_id:
+                    m_p2 = re.search(r'"project_id"\s*:\s*"(\d+)"', html)
+                    if m_p2:
+                        self.project_id = m_p2.group(1)
                 m3 = re.search(r'"payment_account_id":"(\d+)"', html)
                 if m3:
                     self.payment_account_id = m3.group(1)
@@ -605,7 +619,7 @@ class MetaAPI:
             except Exception:
                 pass
 
-        return {"team_id": self.team_id, "payment_account_id": self.payment_account_id}
+        return {"team_id": self.team_id, "payment_account_id": self.payment_account_id, "project_id": self.project_id}
 
     def get_payment_account(self):
         """Query billing to get payment_account_id."""
